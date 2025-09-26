@@ -10,9 +10,9 @@
 #include <csignal>
 #include <iomanip>
 #include <mutex>
+#include <queue>
+#include <condition_variable>
 #include <unordered_set>
-#include <tbb/concurrent_queue.h>
-#include <boost/asio.hpp>
 #include <sqlite3.h>
 
 using namespace rapidjson;
@@ -86,7 +86,9 @@ struct Trade {
 // Global state
 atomic<bool> running{true};
 mutex csvMutex;
-tbb::concurrent_queue<Trade> tradeQueue;
+mutex tradeQueueMutex;
+condition_variable tradeQueueCV;
+queue<Trade> tradeQueue;
 
 // Signal handler
 void signalHandler(int signum) {
@@ -311,22 +313,17 @@ void fetchPools(const string& stablecoin_symbol, const string& token_address, ma
     cout << "Completed fetching pools for " << stablecoin_symbol << " on " << network << endl;
 }
 
-// Event-driven trade fetching
-void fetchTradesEventDriven(const Pool& pool, boost::asio::io_context& io, unordered_set<string>& seenHashes) {
-    boost::asio::steady_timer timer(io, boost::asio::chrono::milliseconds(500));
+// Polling-based trade fetching
+void fetchTradesPolling(const Pool& pool, unordered_set<string>& seenHashes) {
     cpr::Session session;
 
-    auto handler = [&](const boost::system::error_code& ec) {
-        if (!running) return;
-
+    while (running) {
         string url = "https://api.geckoterminal.com/api/v2/networks/" + pool.network + "/pools/" + pool.pool_id + "/trades";
-        cpr::AsyncResponse async = cpr::GetAsync(cpr::Url{url}, cpr::Timeout{1500});
-        async.Wait(); // Note: cpr doesn't natively support async; this is a placeholder. See note below for true async.
-        cpr::Response r = async.Get();
+        cpr::Response r = makeRequestWithBackoff(url, session);
 
         if (r.status_code == 404) {
             cerr << "Pool not found: " << pool.pool_id << " on " << pool.network << endl;
-            return;
+            break;
         }
 
         if (r.status_code == 200) {
@@ -356,9 +353,11 @@ void fetchTradesEventDriven(const Pool& pool, boost::asio::io_context& io, unord
                     }
                 }
                 if (!newTrades.empty()) {
+                    lock_guard<mutex> lock(tradeQueueMutex);
                     for (const auto& trade : newTrades) {
                         tradeQueue.push(trade);
                     }
+                    tradeQueueCV.notify_one();
                     cout << "Queued " << newTrades.size() << " new trades for " << pool.pool_id << " on " << pool.network << endl;
                 }
             }
@@ -366,11 +365,8 @@ void fetchTradesEventDriven(const Pool& pool, boost::asio::io_context& io, unord
             cerr << "Failed to fetch trades for " << pool.pool_id << " on " << pool.network << ": HTTP " << r.status_code << endl;
         }
 
-        timer.expires_at(timer.expiry() + boost::asio::chrono::milliseconds(500));
-        timer.async_wait(handler);
-    };
-
-    timer.async_wait(handler);
+        this_thread::sleep_for(chrono::milliseconds(500)); // Polling interval
+    }
 }
 
 // I/O thread for SQLite storage
@@ -390,9 +386,13 @@ void ioThread(sqlite3* db) {
     }
 
     while (running || !tradeQueue.empty()) {
-        while (tradeQueue.try_pop(batch) && batch.size() < batchSize) {
-            // Wait for more trades or timeout
-            this_thread::sleep_for(chrono::milliseconds(100));
+        {
+            unique_lock<mutex> lock(tradeQueueMutex);
+            tradeQueueCV.wait(lock, [] { return !tradeQueue.empty() || !running; });
+            while (!tradeQueue.empty() && batch.size() < batchSize) {
+                batch.push_back(tradeQueue.front());
+                tradeQueue.pop();
+            }
         }
         if (!batch.empty()) {
             stringstream ss;
@@ -415,6 +415,7 @@ void ioThread(sqlite3* db) {
             cout << "Committed " << batch.size() << " trades to SQLite" << endl;
             batch.clear();
         }
+        this_thread::sleep_for(chrono::milliseconds(100)); // Prevent busy-waiting
     }
     sqlite3_close(db);
 }
@@ -477,20 +478,12 @@ int main() {
     // Launch I/O thread
     thread ioThreadObj(ioThread, db);
 
-    // Launch event-driven trade fetchers with a thread pool (5 threads)
+    // Launch polling-based trade fetchers
     vector<thread> tradeFetchers;
-    vector<boost::asio::io_context> ioContexts(all_pools.size());
-    vector<boost::asio::io_context::work> workItems(all_pools.size());
-    unordered_set<string> seenHashes; // Shared for simplicity; consider per-pool sets for scalability
+    unordered_set<string> seenHashes; // Shared for simplicity
 
-    size_t i = 0;
     for (const auto& [pool_id, pool] : all_pools) {
-        workItems[i] = boost::asio::io_context::work(ioContexts[i]);
-        tradeFetchers.emplace_back([&ioContexts, &pool, &seenHashes, i]() {
-            ioContexts[i].run();
-        });
-        fetchTradesEventDriven(pool, ioContexts[i], seenHashes);
-        i++;
+        tradeFetchers.emplace_back(fetchTradesPolling, pool, ref(seenHashes));
     }
 
     // Wait for trade fetchers to complete
